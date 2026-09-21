@@ -442,14 +442,23 @@ func (c *dataChannel) Push(b []byte) error {
 			break
 		}
 
-		select {
-		case c.popBuf <- c.waitData[:c.waitSize]:
-		default:
-			return fmt.Errorf("pop buffer is full")
-		}
-
+		data := c.waitData[:c.waitSize]
 		c.waitData = c.waitData[c.waitSize:]
 		c.waitSize = 0
+
+		select {
+		case c.popBuf <- data:
+		default:
+			// Consumer is slower than the device, drop the oldest data.
+			select {
+			case <-c.popBuf:
+			default:
+			}
+			select {
+			case c.popBuf <- data:
+			default:
+			}
+		}
 	}
 	return nil
 }

@@ -498,6 +498,18 @@ func (c *Client) Start() error {
 		c.watchdog.start()
 	}
 
+	// A degraded relay leg keeps the DataChannel open but delivers media
+	// slower than real time, so the stream silently falls behind. Close the
+	// client on a sustained stall so the producer re-dials a fresh relay.
+	// Video RTP runs on a fixed 90 kHz clock (RFC 7798), independent of the
+	// rate advertised in the SDP.
+	if c.videoSSRC != nil && video != nil {
+		c.watchdog = newMediaWatchdog(90000, func() {
+			_ = c.Close(errRelayStall)
+		})
+		c.watchdog.start()
+	}
+
 	return c.conn.Start()
 }
 

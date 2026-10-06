@@ -33,6 +33,12 @@ type Client struct {
 	handlers   map[uint32]func(*rtp.Packet)
 
 	watchdog *mediaWatchdog
+
+	// closeMu guards closeErr, the reason Close was called (relay stall, DC
+	// error, mqtt disconnect). Start returns it so the producer worker logs
+	// the cause and reconnects.
+	closeMu  sync.Mutex
+	closeErr error
 }
 
 type DataChannelMessage struct {
@@ -498,19 +504,16 @@ func (c *Client) Start() error {
 		c.watchdog.start()
 	}
 
-	// A degraded relay leg keeps the DataChannel open but delivers media
-	// slower than real time, so the stream silently falls behind. Close the
-	// client on a sustained stall so the producer re-dials a fresh relay.
-	// Video RTP runs on a fixed 90 kHz clock (RFC 7798), independent of the
-	// rate advertised in the SDP.
-	if c.videoSSRC != nil && video != nil {
-		c.watchdog = newMediaWatchdog(90000, func() {
-			_ = c.Close(errRelayStall)
-		})
-		c.watchdog.start()
+	// conn.Start blocks until the peer connection closes. Return the reason
+	// Close was called so the producer worker logs it and re-dials.
+	err := c.conn.Start()
+	c.closeMu.Lock()
+	cerr := c.closeErr
+	c.closeMu.Unlock()
+	if cerr != nil {
+		return cerr
 	}
-
-	return c.conn.Start()
+	return err
 }
 
 func (c *Client) Stop() error {
@@ -537,6 +540,11 @@ func (c *Client) Stop() error {
 }
 
 func (c *Client) Close(err error) error {
+	c.closeMu.Lock()
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
+	c.closeMu.Unlock()
 	c.connected.Done(err)
 	return c.Stop()
 }

@@ -30,6 +30,8 @@ type Client struct {
 	isHEVC     bool
 	handlersMu sync.RWMutex
 	handlers   map[uint32]func(*rtp.Packet)
+
+	watchdog *mediaWatchdog
 }
 
 type DataChannelMessage struct {
@@ -430,6 +432,9 @@ func (c *Client) Start() error {
 			if video != nil {
 				video.WriteRTP(packet)
 			}
+			if c.watchdog != nil {
+				c.watchdog.feed(packet.Timestamp)
+			}
 		})
 	}
 
@@ -439,6 +444,18 @@ func (c *Client) Start() error {
 				audio.WriteRTP(packet)
 			}
 		})
+	}
+
+	// A degraded relay leg keeps the DataChannel open but delivers media
+	// slower than real time, so the stream silently falls behind. Close the
+	// client on a sustained stall so the producer re-dials a fresh relay.
+	// Video RTP runs on a fixed 90 kHz clock (RFC 7798), independent of the
+	// rate advertised in the SDP.
+	if c.videoSSRC != nil && video != nil {
+		c.watchdog = newMediaWatchdog(90000, func() {
+			_ = c.Close(errRelayStall)
+		})
+		c.watchdog.start()
 	}
 
 	return c.conn.Start()
@@ -451,6 +468,9 @@ func (c *Client) Stop() error {
 
 	c.closed = true
 
+	if c.watchdog != nil {
+		c.watchdog.stopWatchdog()
+	}
 	c.clearHandlers()
 
 	if c.conn != nil {

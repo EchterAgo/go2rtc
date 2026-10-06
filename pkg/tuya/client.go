@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/pcm"
@@ -15,6 +16,13 @@ import (
 	"github.com/pion/rtp"
 	pion "github.com/pion/webrtc/v4"
 )
+
+// dialTimeout bounds how long a single dial waits for the camera to answer the
+// offer and open the media channel. A healthy dial completes in a few seconds;
+// if this attempt is dropped (busy relay, camera still holding the previous
+// session) an unbounded wait wedges the reconnect loop until a consumer times
+// out. Returning early lets the producer retry on its own backoff.
+const dialTimeout = 15 * time.Second
 
 type Client struct {
 	api       TuyaAPI
@@ -228,17 +236,23 @@ func Dial(rawURL string) (core.Producer, error) {
 	}
 
 	if client.isHEVC {
-		maxRetransmits := uint16(5)
 		// Each DataChannel message is a complete, self-describing RTP packet
 		// (own sequence number and timestamp), so SCTP ordering is redundant.
 		// An ordered channel turns a single lost packet into head-of-line
 		// blocking: with retransmits and RTO doubling (up to the 60s cap) one
-		// gap can stall delivery for minutes on a lossy link. Unordered keeps
-		// the retransmit reliability but lets later packets through immediately.
+		// gap can stall delivery for minutes on a lossy link.
+		//
+		// Reliability is also time-limited instead of count-limited. Five
+		// retransmits can span minutes, so late frames pile up in the send
+		// queue and arrive as a burst long after they are useful, which makes
+		// consumers report frames arriving too fast. Dropping chunks that
+		// cannot be delivered within the window keeps the queue shallow and
+		// the stream paced at realtime.
+		maxPacketLifeTime := uint16(2000)
 		ordered := false
 		client.dc, err = client.pc.CreateDataChannel("fmp4Stream", &pion.DataChannelInit{
-			MaxRetransmits: &maxRetransmits,
-			Ordered:        &ordered,
+			MaxPacketLifeTime: &maxPacketLifeTime,
+			Ordered:           &ordered,
 		})
 
 		// DataChannel receives two types of messages:
@@ -348,14 +362,28 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	sendOffer.Done(nil)
 
-	// Wait for connection
-	if err = client.connected.Wait(); err != nil {
+	// Wait for connection, bounded so a dropped attempt retries on its own.
+	if err = waitConnected(&client.connected, dialTimeout); err != nil {
 		err = fmt.Errorf("tuya: %w", err)
 		client.Close(err)
 		return nil, err
 	}
 
 	return client, nil
+}
+
+// waitConnected waits for the waiter to finish or for d to elapse, whichever
+// comes first. The waiter is always released by the caller's Close, so the
+// helper goroutine cannot leak.
+func waitConnected(w *core.Waiter, d time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- w.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		return errors.New("dial timeout")
+	}
 }
 
 func (c *Client) GetMedias() []*core.Media {

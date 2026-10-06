@@ -229,7 +229,13 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	if client.isHEVC {
 		maxRetransmits := uint16(5)
-		ordered := true
+		// Each DataChannel message is a complete, self-describing RTP packet
+		// (own sequence number and timestamp), so SCTP ordering is redundant.
+		// An ordered channel turns a single lost packet into head-of-line
+		// blocking: with retransmits and RTO doubling (up to the 60s cap) one
+		// gap can stall delivery for minutes on a lossy link. Unordered keeps
+		// the retransmit reliability but lets later packets through immediately.
+		ordered := false
 		client.dc, err = client.pc.CreateDataChannel("fmp4Stream", &pion.DataChannelInit{
 			MaxRetransmits: &maxRetransmits,
 			Ordered:        &ordered,

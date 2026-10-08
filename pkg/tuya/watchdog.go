@@ -25,6 +25,10 @@ type mediaWatchdog struct {
 	stallWindows int
 	period       time.Duration
 	onStall      func()
+	// suppress, when it reports true, means media is expected to pause (a
+	// rollover standby dial freezes the primary's fan-out), so the window is
+	// not counted as a stall.
+	suppress func() bool
 
 	mu       sync.Mutex
 	media    int64 // accumulated media time in ns

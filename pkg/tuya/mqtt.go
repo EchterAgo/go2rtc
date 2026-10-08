@@ -145,11 +145,17 @@ func (c *TuyaMqttClient) Start(hubConfig *MQTTConfig, webrtcConfig *WebRTCConfig
 		return token.Error()
 	}
 
-	if err := c.waiter.Wait(); err != nil {
+	// onConnect releases the waiter after subscribing; if the broker link
+	// stalls, auto-reconnect retries forever, so bound the wait and let the
+	// dial fail instead of wedging the caller.
+	subErr := make(chan error, 1)
+	go func() { subErr <- c.waiter.Wait() }()
+	select {
+	case err := <-subErr:
 		return err
+	case <-time.After(20 * time.Second):
+		return errors.New("mqtt: subscribe timeout")
 	}
-
-	return nil
 }
 
 func (c *TuyaMqttClient) Stop() {

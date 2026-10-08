@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -41,6 +42,46 @@ type Client struct {
 	handlers   map[uint32]func(*rtp.Packet)
 
 	watchdog *mediaWatchdog
+
+	// Rollover splices a pre-warmed standby session in before the relay's
+	// ~600s session cap (verified: nothing defers the cap, so the only fix is
+	// to replace the session before it fires). The primary Client is a stable
+	// shell the producer holds: Start blocks on svcDone, not on any transport,
+	// so retiring a connection during a splice does not wake the producer or
+	// detach consumers. activeConn is the transport currently feeding the
+	// shell's receivers; a standby splices in on its first keyframe, aligned
+	// to the primary timeline by wall clock. Opt-in via ?rollover=1.
+	rawURL       string
+	rollover     bool
+	spliceMu     sync.Mutex
+	sp           *splicer
+	activeConn   atomic.Pointer[Client]
+	standby      *Client // pending standby, guarded by spliceMu
+	svcDone      core.Waiter
+	video        *core.Receiver
+	audio        *core.Receiver
+	rolloverStop chan struct{}
+	stopOnce     sync.Once
+	dialing      atomic.Bool
+
+	// Per-transport state. The shell is its own first transport (parent == c);
+	// standbys get parent set in dialStandby. activeAt is when the transport
+	// became active; rolloverLoop dials a replacement before the relay cap.
+	// retired stops the transport's media handlers writing to the shell, so
+	// splice teardown and the relay's end-of-session events cannot end the
+	// service or double-write frames.
+	parent     *Client
+	activeAt   time.Time
+	dialAt     time.Time
+	tsShift    uint32
+	seqShift   uint16
+	retired    atomic.Bool
+	svcStopped atomic.Bool
+
+	// writeMu serializes shell receiver writes across transports, so a
+	// straggler from a retired transport cannot interleave with the splice
+	// and push non-monotonic timestamps to consumers.
+	writeMu sync.Mutex
 
 	// closeMu guards closeErr, the reason Close was called (relay stall, DC
 	// error, mqtt disconnect). Start returns it so the producer worker logs
@@ -87,6 +128,7 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	// Stream params
 	streamResolution := query.Get("resolution")
+	rollover := query.Get("rollover") == "1"
 
 	useSmartApi := deviceId != "" && email != "" && password != ""
 	useCloudApi := deviceId != "" && uid != "" && clientId != "" && clientSecret != ""
@@ -119,6 +161,8 @@ func Dial(rawURL string) (core.Producer, error) {
 
 	client.streamType = client.api.GetStreamType(streamResolution)
 	client.isHEVC = client.api.IsHEVC(client.streamType)
+	client.rawURL = rawURL
+	client.rollover = rollover && client.isHEVC
 
 	// Create a new PeerConnection
 	conf := pion.Configuration{
@@ -369,6 +413,14 @@ func Dial(rawURL string) (core.Producer, error) {
 		return nil, err
 	}
 
+	// The shell is its own first transport. Standbys keep the plain handlers
+	// installed by their own Dial until the shell swaps them in dialStandby.
+	if client.rollover {
+		client.parent = client
+		client.activeAt = time.Now()
+		client.activeConn.Store(client)
+	}
+
 	return client, nil
 }
 
@@ -511,19 +563,26 @@ func (c *Client) Start() error {
 		}
 	}
 
-	if c.videoSSRC != nil {
-		c.setHandler(*c.videoSSRC, func(packet *rtp.Packet) {
-			if video != nil {
-				video.WriteRTP(packet)
-			}
-			if c.watchdog != nil {
-				c.watchdog.feed(packet.Timestamp)
-			}
-		})
-	}
+	if c.rollover {
+		// shell mode: handlers write through the splicer into the shell's
+		// receivers, and a maintenance loop keeps a standby ready to splice
+		c.video, c.audio = video, audio
+		c.startRollover()
+	} else {
+		if c.videoSSRC != nil {
+			c.setHandler(*c.videoSSRC, func(packet *rtp.Packet) {
+				if video != nil {
+					video.WriteRTP(packet)
+				}
+				if c.watchdog != nil {
+					c.watchdog.feed(packet.Timestamp)
+				}
+			})
+		}
 
-	if c.audioSSRC != nil && audio != nil {
-		c.setHandler(*c.audioSSRC, reclockPCM(audio.Codec, audio.WriteRTP))
+		if c.audioSSRC != nil && audio != nil {
+			c.setHandler(*c.audioSSRC, reclockPCM(audio.Codec, audio.WriteRTP))
+		}
 	}
 
 	// A degraded relay leg keeps the DataChannel open but delivers media
@@ -533,14 +592,46 @@ func (c *Client) Start() error {
 	// rate advertised in the SDP.
 	if c.videoSSRC != nil && video != nil {
 		c.watchdog = newMediaWatchdog(90000, func() {
-			_ = c.Close(errRelayStall)
+			if c.rollover {
+				// the watchdog watches the shell's media, so a stall
+				// ends the service regardless of which transport is
+				// feeding it
+				debugf("rollover watchdog stall, ending service")
+				c.endService(errRelayStall)
+			} else {
+				_ = c.Close(errRelayStall)
+			}
 		})
+		if c.rollover {
+			// dialing a standby, and holding one before the splice,
+			// pauses the camera's fan-out to the primary: that is the
+			// make-before-break working, not a degraded relay leg. The
+			// window is bounded by the dial timeout and, once a standby
+			// is registered, by its replacement age and the relay cap,
+			// so a genuine stall still trips the watchdog.
+			c.watchdog.suppress = func() bool {
+				if c.dialing.Load() {
+					return true
+				}
+				c.spliceMu.Lock()
+				pending := c.standby != nil
+				c.spliceMu.Unlock()
+				return pending
+			}
+		}
 		c.watchdog.start()
 	}
 
-	// conn.Start blocks until the peer connection closes. Return the reason
-	// Close was called so the producer worker logs it and re-dials.
-	err := c.conn.Start()
+	// In shell mode Start blocks on the service, not the transport: splices
+	// retire connections without waking the producer. Otherwise conn.Start
+	// blocks until the peer connection closes. Return the reason Close was
+	// called so the producer worker logs it and re-dials.
+	var err error
+	if c.rollover {
+		err = c.svcDone.Wait()
+	} else {
+		err = c.conn.Start()
+	}
 	c.closeMu.Lock()
 	cerr := c.closeErr
 	c.closeMu.Unlock()
@@ -556,10 +647,44 @@ func (c *Client) Stop() error {
 	}
 
 	c.closed = true
+	c.svcStopped.Store(true)
+
+	if c.rolloverStop != nil {
+		c.stopOnce.Do(func() { close(c.rolloverStop) })
+	}
 
 	if c.watchdog != nil {
 		c.watchdog.stopWatchdog()
 	}
+
+	if c.rollover {
+		// tear down the shell's transports: the pending standby and the
+		// active one (which may not be the shell's own session anymore),
+		// then release Start
+		c.spliceMu.Lock()
+		standby, active := c.standby, c.activeConn.Load()
+		c.standby = nil
+		c.activeConn.Store(nil)
+		c.spliceMu.Unlock()
+		if standby != nil {
+			standby.retired.Store(true)
+			_ = standby.stopTransport()
+		}
+		if active != nil && active != c {
+			active.retired.Store(true)
+			_ = active.stopTransport()
+		}
+		c.svcDone.Done(errors.New("stopped"))
+	}
+
+	return c.stopTransport()
+}
+
+// stopTransport tears down one session's own resources (handlers, peer
+// connection, mqtt/api) without touching shell service state. A Client whose
+// rollover transport was spliced out is retired through this, so closing the
+// old session cannot release svcDone.
+func (c *Client) stopTransport() error {
 	c.clearHandlers()
 
 	if c.conn != nil {
@@ -574,12 +699,22 @@ func (c *Client) Stop() error {
 }
 
 func (c *Client) Close(err error) error {
+	// release any dial waiter on this transport
+	c.connected.Done(err)
+	if c.parent != nil {
+		// transport death event (DataChannel closed at the relay cap, mqtt
+		// disconnect, ICE failure): the shell decides whether it ends the
+		// service, so splice teardown cannot wake the producer. Only
+		// endService records closeErr, so a retired transport's ordinary
+		// end-of-session close is not mistaken for the service failure.
+		c.parent.transportClosed(c, err)
+		return nil
+	}
 	c.closeMu.Lock()
 	if c.closeErr == nil {
 		c.closeErr = err
 	}
 	c.closeMu.Unlock()
-	c.connected.Done(err)
 	return c.Stop()
 }
 

@@ -10,15 +10,24 @@ import (
 	"strconv"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
+	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/tuya"
+	"github.com/rs/zerolog"
 )
 
+var log zerolog.Logger
+
 func Init() {
+	// inside Init: the package logger is only configured after app.initLogger
+	log = app.GetLogger("tuya")
 	streams.HandleFunc("tuya", func(source string) (core.Producer, error) {
 		return tuya.Dial(source)
 	})
+	tuya.DebugLog = func(format string, args ...any) {
+		log.Debug().Msgf(format, args...)
+	}
 
 	api.HandleFunc("api/tuya", apiTuya)
 }
